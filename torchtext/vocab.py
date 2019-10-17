@@ -11,10 +11,18 @@ from six.moves.urllib.request import urlretrieve
 import torch
 from tqdm import tqdm
 import tarfile
+import math
 
 from .utils import reporthook
 
+from collections import Counter
+
 logger = logging.getLogger(__name__)
+
+
+def _unk_init(token):
+    s = math.sqrt(3 / token.size(-1))
+    return (torch.randn(token.size(), dtype=token.dtype, device=token.device) * 2 + 1) * s
 
 
 class Vocab(object):
@@ -27,7 +35,11 @@ class Vocab(object):
             numerical identifiers.
         itos: A list of token strings indexed by their numerical identifiers.
     """
-    def __init__(self, counter, max_size=None, min_freq=1, specials=['<pad>'],
+
+    # TODO (@mttk): Populate classs with default values of special symbols
+    UNK = '<unk>'
+
+    def __init__(self, counter, max_size=None, min_freq=1, specials=['<unk>', '<pad>'],
                  vectors=None, unk_init=None, vectors_cache=None, specials_first=True):
         """Create a Vocab object from a collections.Counter.
 
@@ -39,14 +51,13 @@ class Vocab(object):
             min_freq: The minimum frequency needed to include a token in the
                 vocabulary. Values less than 1 will be set to 1. Default: 1.
             specials: The list of special tokens (e.g., padding or eos) that
-                will be prepended to the vocabulary in addition to an <unk>
-                token. Default: ['<pad>']
+                will be prepended to the vocabulary. Default: ['<unk'>, '<pad>']
             vectors: One of either the available pretrained vectors
                 or custom pretrained vectors (see Vocab.load_vectors);
                 or a list of aforementioned vectors
             unk_init (callback): by default, initialize out-of-vocabulary word vectors
                 to zero vectors; can be any function that takes in a Tensor and
-                returns a Tensor of the same size. Default: torch.Tensor.zero_
+                returns a Tensor of the same size. Default: _unk_init
             vectors_cache: directory for cached vectors. Default: '.vector_cache'
             specials_first: Whether to add special tokens into the vocabulary at first.
                 If it is False, they are added into the vocabulary at last.
@@ -57,15 +68,16 @@ class Vocab(object):
         min_freq = max(min_freq, 1)
 
         self.itos = list()
+        self.unk_index = None
         if specials_first:
             self.itos = list(specials)
+            # only extend max size if specials are prepended
+            max_size = None if max_size is None else max_size + len(specials)
 
         # frequencies of special tokens are not counted when building vocabulary
         # in frequency order
         for tok in specials:
             del counter[tok]
-
-        max_size = None if max_size is None else max_size + len(self.itos)
 
         # sort by frequency, then alphabetically
         words_and_frequencies = sorted(counter.items(), key=lambda tup: tup[0])
@@ -76,13 +88,16 @@ class Vocab(object):
                 break
             self.itos.append(word)
 
-        if not specials_first:
-            self.itos.extend(list(specials))
-
-        if '<unk>' in specials:  # hard-coded for now
-            self.stoi = defaultdict(_default_unk_index)
+        if Vocab.UNK in specials:  # hard-coded for now
+            unk_index = specials.index(Vocab.UNK)  # position in list
+            # account for ordering of specials, set variable
+            self.unk_index = unk_index if specials_first else len(self.itos) + unk_index
+            self.stoi = defaultdict(self._default_unk_index)
         else:
             self.stoi = defaultdict()
+
+        if not specials_first:
+            self.itos.extend(list(specials))
 
         # stoi is simply a reverse dict for itos
         self.stoi.update({tok: i for i, tok in enumerate(self.itos)})
@@ -92,6 +107,28 @@ class Vocab(object):
             self.load_vectors(vectors, unk_init=unk_init, cache=vectors_cache)
         else:
             assert unk_init is None and vectors_cache is None
+
+    def _default_unk_index(self):
+        return self.unk_index
+
+    def __getitem__(self, token):
+        return self.stoi.get(token, self.stoi.get(Vocab.UNK))
+
+    def __getstate__(self):
+        # avoid picking defaultdict
+        attrs = dict(self.__dict__)
+        # cast to regular dict
+        attrs['stoi'] = dict(self.stoi)
+        return attrs
+
+    def __setstate__(self, state):
+        if state.get("unk_index", None) is None:
+            stoi = defaultdict()
+        else:
+            stoi = defaultdict(self._default_unk_index)
+        stoi.update(state['stoi'])
+        state['stoi'] = stoi
+        self.__dict__.update(state)
 
     def __eq__(self, other):
         if self.freqs != other.freqs:
@@ -162,9 +199,9 @@ class Vocab(object):
                 end_dim = start_dim + v.dim
                 self.vectors[i][start_dim:end_dim] = v[token.strip()]
                 start_dim = end_dim
-            assert(start_dim == tot_dim)
+            assert (start_dim == tot_dim)
 
-    def set_vectors(self, stoi, vectors, dim, unk_init=torch.Tensor.zero_):
+    def set_vectors(self, stoi, vectors, dim, unk_init=_unk_init):
         """
         Set the vectors for the Vocab instance from a collection of Tensors.
 
@@ -178,7 +215,7 @@ class Vocab(object):
             dim: The dimensionality of the vectors.
             unk_init (callback): by default, initialize out-of-vocabulary word vectors
                 to zero vectors; can be any function that takes in a Tensor and
-                returns a Tensor of the same size. Default: torch.Tensor.zero_
+                returns a Tensor of the same size. Default: _unk_init
         """
         self.vectors = torch.Tensor(len(self), dim)
         for i, token in enumerate(self.itos):
@@ -192,7 +229,7 @@ class Vocab(object):
 class SubwordVocab(Vocab):
 
     def __init__(self, counter, max_size=None, specials=['<pad>'],
-                 vectors=None, unk_init=torch.Tensor.zero_):
+                 vectors=None, unk_init=_unk_init):
         """Create a revtok subword vocabulary from a collections.Counter.
 
         Arguments:
@@ -208,7 +245,7 @@ class SubwordVocab(Vocab):
                 or a list of aforementioned vectors
             unk_init (callback): by default, initialize out-of-vocabulary word vectors
                 to zero vectors; can be any function that takes in a Tensor and
-                returns a Tensor of the same size. Default: torch.Tensor.zero_
+                returns a Tensor of the same size. Default: _unk_init
         """
         try:
             import revtok
@@ -216,7 +253,15 @@ class SubwordVocab(Vocab):
             print("Please install revtok.")
             raise
 
-        self.stoi = defaultdict(_default_unk_index)
+        # Hardcode unk_index as subword_vocab has no specials_first argument
+        self.unk_index = (specials.index(SubwordVocab.UNK)
+                          if SubwordVocab.UNK in specials else None)
+
+        if self.unk_index is None:
+            self.stoi = defaultdict()
+        else:
+            self.stoi = defaultdict(self._default_unk_index)
+
         self.stoi.update({tok: i for i, tok in enumerate(specials)})
         self.itos = specials.copy()
 
@@ -280,7 +325,7 @@ class Vectors(object):
         self.stoi = None
         self.vectors = None
         self.dim = None
-        self.unk_init = torch.Tensor.zero_ if unk_init is None else unk_init
+        self.unk_init = _unk_init if unk_init is None else unk_init
         self.cache(name, cache, url=url, max_vectors=max_vectors)
 
     def __getitem__(self, token):
@@ -290,6 +335,8 @@ class Vectors(object):
             return self.unk_init(torch.Tensor(self.dim))
 
     def cache(self, name, cache, url=None, max_vectors=None):
+        import ssl
+        ssl._create_default_https_context = ssl._create_unverified_context
         if os.path.isfile(name):
             path = name
             if max_vectors:
@@ -345,7 +392,7 @@ class Vectors(object):
 
                 itos, vectors, dim = [], torch.zeros((max_vectors, dim)), None
 
-                for line in tqdm(f, total=num_lines):
+                for line in tqdm(f, total=max_vectors):
                     # Explicitly splitting on " " is important, so we don't
                     # get rid of Unicode non-breaking spaces in the vectors.
                     entries = line.rstrip().split(b" ")
@@ -390,6 +437,44 @@ class Vectors(object):
             logger.info('Loading vectors from {}'.format(path_pt))
             self.itos, self.stoi, self.vectors, self.dim = torch.load(path_pt)
 
+    def __len__(self):
+        return len(self.vectors)
+
+    def get_vecs_by_tokens(self, tokens, lower_case_backup=False):
+        """Look up embedding vectors of tokens.
+
+        Arguments:
+            tokens: a token or a list of tokens. if `tokens` is a string,
+                returns a 1-D tensor of shape `self.dim`; if `tokens` is a
+                list of strings, returns a 2-D tensor of shape=(len(tokens),
+                self.dim).
+            lower_case_backup : Whether to look up the token in the lower case.
+                If False, each token in the original case will be looked up;
+                if True, each token in the original case will be looked up first,
+                if not found in the keys of the property `stoi`, the token in the
+                lower case will be looked up. Default: False.
+
+        Examples:
+            >>> examples = ['chip', 'baby', 'Beautiful']
+            >>> vec = text.vocab.GloVe(name='6B', dim=50)
+            >>> ret = vec.get_vecs_by_tokens(tokens, lower_case_backup=True)
+        """
+        to_reduce = False
+
+        if not isinstance(tokens, list):
+            tokens = [tokens]
+            to_reduce = True
+
+        if not lower_case_backup:
+            indices = [self[token] for token in tokens]
+        else:
+            indices = [self[token] if token in self.stoi
+                       else self[token.lower()]
+                       for token in tokens]
+
+        vecs = torch.stack(indices)
+        return vecs[0] if to_reduce else vecs
+
 
 class GloVe(Vectors):
     url = {
@@ -406,8 +491,7 @@ class GloVe(Vectors):
 
 
 class FastText(Vectors):
-
-    url_base = 'https://s3-us-west-1.amazonaws.com/fasttext-vectors/wiki.{}.vec'
+    url_base = 'https://dl.fbaipublicfiles.com/fasttext/vectors-wiki/wiki.{}.vec'
 
     def __init__(self, language="en", **kwargs):
         url = self.url_base.format(language)
@@ -416,7 +500,6 @@ class FastText(Vectors):
 
 
 class CharNGram(Vectors):
-
     name = 'charNgram.txt'
     url = ('http://www.logos.t.u-tokyo.ac.jp/~hassy/publications/arxiv2016jmt/'
            'jmt_pre-trained_embeddings.tar.gz')
@@ -447,10 +530,6 @@ class CharNGram(Vectors):
         return vector
 
 
-def _default_unk_index():
-    return 0
-
-
 pretrained_aliases = {
     "charngram.100d": partial(CharNGram),
     "fasttext.en.300d": partial(FastText, language="en"),
@@ -467,3 +546,20 @@ pretrained_aliases = {
     "glove.6B.300d": partial(GloVe, name="6B", dim="300")
 }
 """Mapping from string name to factory function"""
+
+
+def build_vocab_from_iterator(iterator):
+    """
+    Build a Vocab from an iterator.
+
+    Arguments:
+        iterator: Iterator used to build Vocab. Must yield list or iterator of tokens.
+    """
+
+    counter = Counter()
+    with tqdm(unit_scale=0, unit='lines') as t:
+        for tokens in iterator:
+            counter.update(tokens)
+            t.update(1)
+    word_vocab = Vocab(counter)
+    return word_vocab
